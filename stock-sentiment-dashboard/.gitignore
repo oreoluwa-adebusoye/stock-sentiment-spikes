@@ -1,0 +1,13 @@
+# venvs & caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS/editor stuff
+.DS_Store
+.idea/
+.vscode/
+
+# streamlit
+.streamlit/
