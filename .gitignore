@@ -1,6 +1,6 @@
 # venvs & caches
 .venv/
-venv/
+stock-sentiment-dashboard/venv/
 __pycache__/
 *.pyc
 

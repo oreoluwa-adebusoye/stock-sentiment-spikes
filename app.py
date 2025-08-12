@@ -1,4 +1,4 @@
-# app.py — Stock News Sentiment: Spikes + Tiny Backtest (Phase 1)
+# app.py — Stock News Sentiment: Spikes + Tiny Backtest
 # Features:
 # - Sidebar: ticker, date range, headlines source (CSV or tiny sample)
 # - Cleans headlines -> VADER sentiment -> daily average
@@ -15,6 +15,8 @@ import yfinance as yf
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from datetime import date, timedelta, datetime
 import re
+from typing import List
+
 
 
 # ---------------- UI Setup ----------------
@@ -48,6 +50,23 @@ def load_prices(ticker: str, start_dt: date, end_dt: date) -> pd.DataFrame:
 @st.cache_resource(show_spinner=False)
 def get_vader() -> SentimentIntensityAnalyzer:
     return SentimentIntensityAnalyzer()
+
+@st.cache_resource(show_spinner=True)
+def load_finbert_pipe():
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+    tok = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+    mdl = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+    return pipeline("text-classification", model=mdl, tokenizer=tok, return_all_scores=True, truncation=True)
+
+def vader_compound(analyzer, text: str) -> float:
+    return analyzer.polarity_scores(str(text))["compound"]
+
+def finbert_compound(pipe, text: str) -> float:
+    res = pipe(str(text))[0]  # list of dicts
+    scores = {d["label"].lower(): d["score"] for d in res}
+    # map to [-1,1] by (pos - neg)
+    return float(scores.get("positive", 0.0) - scores.get("negative", 0.0))
+
 
 def reshape_if_kaggle(df: pd.DataFrame) -> pd.DataFrame:
     """Accepts Kaggle Combined_News_DJIA.csv (Date + Top1..Top25) or already-long format.
@@ -151,6 +170,12 @@ end_date = st.sidebar.date_input("End Date", value=today)
 st.sidebar.header("Headlines Source")
 mode = st.sidebar.radio("Mode", ["Historical CSV", "Tiny Sample"], index=0)
 
+st.sidebar.header("Sentiment Model")
+use_finbert = st.sidebar.checkbox("Use FinBERT (finance-tuned)", value=False)
+finbert_weight = st.sidebar.slider("FinBERT weight (vs VADER)", 0.0, 1.0, 0.6, 0.05, disabled=not use_finbert)
+max_rows = st.sidebar.slider("Max headlines to score", 500, 20000, 4000, 500, help="Keeps it fast when FinBERT is on.")
+
+
 aliases_text = st.sidebar.text_input("Company aliases (comma-separated)", f"{ticker}, Apple, AAPL")
 keyword_text = st.sidebar.text_input("Optional keywords to keep", "earnings, guidance, CEO, lawsuit, upgrade, downgrade, supply, strike")
 aliases = [a.strip() for a in aliases_text.split(",") if a.strip()]
@@ -187,6 +212,48 @@ if headlines.empty:
 # Filter to company & optional keywords
 headlines = filter_headlines(headlines, aliases, keep_keywords)
 
+# Limit rows to keep FinBERT fast
+headlines = headlines.sort_values("date").tail(max_rows).copy()
+
+# Score per headline
+analyzer = get_vader()
+headlines["vader"] = headlines["headline"].apply(lambda t: vader_compound(analyzer, t))
+
+if use_finbert:
+    try:
+        fb = load_finbert_pipe()
+        # Batch for speed
+        texts: List[str] = headlines["headline"].astype(str).tolist()
+        outs = fb(texts, batch_size=32, truncation=True)
+        # Convert list-of-lists to scalar scores
+        fin_scores = []
+        for o in outs:
+            sc = {d["label"].lower(): d["score"] for d in o}
+            fin_scores.append(sc.get("positive",0.0) - sc.get("negative",0.0))
+        headlines["finbert"] = fin_scores
+    except Exception as e:
+        st.warning(f"FinBERT failed ({e}). Falling back to VADER only.")
+        use_finbert = False
+        headlines["finbert"] = np.nan
+else:
+    headlines["finbert"] = np.nan
+
+# Ensemble
+if use_finbert:
+    headlines["sentiment_headline"] = finbert_weight*headlines["finbert"] + (1 - finbert_weight)*headlines["vader"]
+else:
+    headlines["sentiment_headline"] = headlines["vader"]
+
+# Aggregate to daily mean sentiment
+daily = (
+    headlines
+      .assign(date=pd.to_datetime(headlines["date"]).dt.tz_localize(None))
+      .groupby(headlines["date"].dt.date)[["sentiment_headline","vader","finbert"]]
+      .mean()
+      .rename(columns={"sentiment_headline":"sentiment"})
+)
+daily.index = pd.to_datetime(daily.index)
+daily = daily.asfreq("B").ffill().reset_index().rename(columns={"index":"date"})
 
 # ---------------- Sentiment & Merge ----------------
 analyzer = get_vader()
@@ -262,6 +329,89 @@ c2.metric("Avg next-day after + spike", f"{avg_next_pos:.2f}%")
 c3.metric("Avg next-day after − spike", f"{avg_next_neg:.2f}%")
 c4.metric("Sharpe (rough)", f"{sharpe:.2f}")
 st.caption(f"Max Drawdown (Strategy): {mdd:.1%}")
+
+# ===================== Event Study: Avg Abnormal Returns around Spikes =====================
+st.subheader("📅 Event Study: average abnormal returns around sentiment spikes")
+
+bench_ticker = st.text_input("Benchmark ticker (for abnormal returns)", "SPY")
+k = st.slider("Event window (business days, ±k)", 1, 10, 3)
+use_log = st.checkbox("Use log returns", value=True)
+
+# Fetch benchmark prices
+bench = yf.download(bench_ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
+if bench.empty:
+    st.warning("No benchmark data for that ticker/range. Try another benchmark.")
+else:
+    # Prep benchmark
+    bench = bench.rename_axis("Date").reset_index()[["Date", "Close"]]
+    bench["Date"] = pd.to_datetime(bench["Date"]).dt.tz_localize(None)
+    bench = bench.set_index("Date").asfreq("B").ffill()
+
+    # Prep asset (from merged)
+    asset = merged[["date", "Close"]].copy()
+    asset = asset.set_index("date").asfreq("B").ffill()
+
+    # Returns (keep as Series)
+    if use_log:
+        r_asset = np.log(asset["Close"]).diff()
+        r_bench = np.log(bench["Close"]).diff().reindex(asset.index).fillna(0.0)
+    else:
+        r_asset = asset["Close"].pct_change()
+        r_bench = bench["Close"].pct_change().reindex(asset.index).fillna(0.0)
+
+    # Safety: if either ended up as DataFrame, squeeze to Series
+    if isinstance(r_asset, pd.DataFrame):
+        r_asset = r_asset.iloc[:, 0]
+    if isinstance(r_bench, pd.DataFrame):
+        r_bench = r_bench.iloc[:, 0]
+
+    # Abnormal return = asset - benchmark (Series)
+    ar = (r_asset - r_bench)
+    ar.name = "AR"  # set the Series name explicitly
+
+
+    def make_car(event_dates, label):
+        windows = []
+        for d in pd.to_datetime(event_dates):
+            # build ±k business-day window
+            win_idx = pd.date_range(d - pd.tseries.offsets.BDay(k),
+                                    d + pd.tseries.offsets.BDay(k), freq="B")
+            w = ar.reindex(win_idx)
+            # allow small gaps, fill with 0 to avoid biasing CAR
+            if w.isna().sum() <= 2:
+                w = w.fillna(0.0)
+                w.index = range(-k, k+1)   # align by relative day
+                windows.append(w)
+        if not windows:
+            return None, 0
+        mat = pd.concat(windows, axis=1)  # columns = events
+        car = mat.cumsum(axis=0).mean(axis=1)  # average CAR across events
+        return car.rename(label), mat.shape[1]
+
+    pos_dates = merged.loc[merged["pos_spike"], "date"]
+    neg_dates = merged.loc[merged["neg_spike"], "date"]
+
+    car_pos, n_pos = make_car(pos_dates, "Avg CAR after + spikes")
+    car_neg, n_neg = make_car(neg_dates, "Avg CAR after − spikes")
+
+    # Show results
+    if car_pos is not None:
+        st.line_chart(pd.DataFrame({car_pos.name: car_pos}))
+        c1, c2 = st.columns(2)
+        c1.metric("CAR at +1 (pos)", f"{(car_pos.loc[1]*100):.2f}%")
+        c2.metric(f"CAR at +{min(3,k)} (pos)", f"{(car_pos.loc[min(3,k)]*100):.2f}%")
+        st.caption(f"Included {n_pos} positive-spike events.")
+    else:
+        st.info("No positive-spike events in the window.")
+
+    if car_neg is not None:
+        st.line_chart(pd.DataFrame({car_neg.name: car_neg}))
+        c3, c4 = st.columns(2)
+        c3.metric("CAR at +1 (neg)", f"{(car_neg.loc[1]*100):.2f}%")
+        c4.metric(f"CAR at +{min(3,k)} (neg)", f"{(car_neg.loc[min(3,k)]*100):.2f}%")
+        st.caption(f"Included {n_neg} negative-spike events.")
+    else:
+        st.info("No negative-spike events in the window.")
 
 # ---------------- Optional: Price Spikes ----------------
 with st.expander("➕ Compare to price spikes (optional)"):
